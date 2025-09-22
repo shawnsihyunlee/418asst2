@@ -17,6 +17,7 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+// These two need to be equal.
 #define BLOCK_SIZE 1024
 #define CIRC_CHUNK 256
 
@@ -515,6 +516,66 @@ shadePixelAcc(float2 pixelCenter, const float3 p, const float rad, float4& acc, 
     // END SHOULD-BE-ATOMIC REGION
 }
 
+__device__ __inline__ void stageCircleToShared(
+    int lane, int cid,
+    float* sh_px, float* sh_py, float* sh_pz, float* sh_r,
+    float* sh_cr, float* sh_cg, float* sh_cb,
+    bool isSnow)
+{
+    const float* pos = &cuConstRendererParams.position[3 * cid];
+    sh_px[lane] = pos[0];
+    sh_py[lane] = pos[1];
+    sh_pz[lane] = pos[2];
+    sh_r [lane] = cuConstRendererParams.radius[cid];
+
+    if (!isSnow) {
+        const int c3 = 3 * cid;
+        sh_cr[lane] = cuConstRendererParams.color[c3 + 0];
+        sh_cg[lane] = cuConstRendererParams.color[c3 + 1];
+        sh_cb[lane] = cuConstRendererParams.color[c3 + 2];
+    }
+}
+
+__device__ __inline__ void shadePixelSharedMem(
+    const float2& pixelCenter,
+    float4& acc,
+    int idx,
+    const float* sh_px, const float* sh_py, const float* sh_pz,
+    const float* sh_r, const float* sh_cr, const float* sh_cg, const float* sh_cb,
+    bool isSnow)
+{
+    const float diffX = sh_px[idx] - pixelCenter.x;
+    const float diffY = sh_py[idx] - pixelCenter.y;
+    const float rad = sh_r[idx];
+    const float pixelDist = diffX * diffX + diffY * diffY;
+    const float maxDist = rad * rad;
+
+    if (pixelDist > maxDist) return;
+
+    float3 rgb;
+    float alpha;
+    if (isSnow) {
+        const float kCircleMaxAlpha = .5f;
+        const float falloffScale    = 4.f;
+        float normPixelDist = sqrt(pixelDist) / rad;
+        rgb = lookupColor(normPixelDist);
+        float maxAlpha = .6f + .4f * (1.f - sh_pz[idx]);
+        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
+        alpha = maxAlpha * __expf(-falloffScale * normPixelDist * normPixelDist);
+    } else {
+        rgb.x = sh_cr[idx];
+        rgb.y = sh_cg[idx];
+        rgb.z = sh_cb[idx];
+        alpha = .5f;
+    }
+
+    const float oneMinusAlpha = 1.f - alpha;
+    acc.x = alpha * rgb.x + oneMinusAlpha * acc.x;
+    acc.y = alpha * rgb.y + oneMinusAlpha * acc.y;
+    acc.z = alpha * rgb.z + oneMinusAlpha * acc.z;
+    acc.w = alpha + acc.w;
+}
+
 // kernelRenderCircles -- (CUDA device code)
 //
 // Each thread renders a circle.  Since there is no protection to
@@ -741,93 +802,127 @@ __global__ void kernelCompressIndices(const int* __restrict__ prefix,
 }
 
 __global__ void kernelRenderTiles(const int* __restrict__ indexOrderMap,
-                                                const int* __restrict__ counts,
-                                                int numCircles)
+                                  const int* __restrict__ counts,
+                                  int numCircles)
 {
-    int tileX = blockIdx.x;
-    int tileY = blockIdx.y;
-    int tile  = tileY * cuConstRendererParams.tilesPerWidth + tileX;
+    const int tileX = blockIdx.x;
+    const int tileY = blockIdx.y;
+    const int tile  = tileY * cuConstRendererParams.tilesPerWidth + tileX;
     if (tile >= cuConstRendererParams.numTiles) return;
 
-    // Calculate pixels corresponding to this tile
-    const int tileSize      = cuConstRendererParams.tileSize;
-    const int imgW          = cuConstRendererParams.imageWidth;
-    const int imgH          = cuConstRendererParams.imageHeight;
+    const int tileSize = cuConstRendererParams.tileSize;
+    const int imgW     = cuConstRendererParams.imageWidth;
+    const int imgH     = cuConstRendererParams.imageHeight;
 
     const int startX = tileX * tileSize;
     const int startY = tileY * tileSize;
     const int endX   = min(startX + tileSize, imgW); // exclusive
     const int endY   = min(startY + tileSize, imgH); // exclusive
 
-    // How many circles overlap this tile? If zero, we can skip.
-    const int count = counts[tile];
-    if (count <= 0) return;
+    const int circleCount = counts[tile];
+    if (circleCount <= 0) return;
 
-    // Base of this tile's circle indices.
     const int base = tile * numCircles;
 
-    // Shared memory layout: px[C], py[C], pz[C], rad[C]
+    // We utilize shared memory for:
+    // 1. Circle positions
+    // 2. Circle radii
+    // 3. Circle colors
+    // so that we can minimize global memory reads in the hot path.
     extern __shared__ float shmem[];
     float* sh_px = shmem;
     float* sh_py = sh_px + CIRC_CHUNK;
     float* sh_pz = sh_py + CIRC_CHUNK;
     float* sh_r  = sh_pz + CIRC_CHUNK;
+    // re-interpret the next slab as int for indices
+    int*   sh_idx = reinterpret_cast<int*>(sh_r + CIRC_CHUNK);
+    // colors (always reserve; only used if not snow)
+    float* sh_cr = reinterpret_cast<float*>(sh_idx + CIRC_CHUNK);
+    float* sh_cg = sh_cr + CIRC_CHUNK;
+    float* sh_cb = sh_cg + CIRC_CHUNK;
 
-    // Flattened thread id in the block to help with cooperative loads
-    const int lane = threadIdx.y * blockDim.x + threadIdx.x;
-    const int lanes = blockDim.x * blockDim.y;
+    // 'lane' is the flattened 2d index of this thread within this block,
+    // i.e., a block-local unique id. Each thread will load one circle into 
+    // shared memory, for a total of CIRC_CHUNK = BLOCK_SIZE circles staged
+    // into shared memory.
+    const int lane  = threadIdx.y * blockDim.x + threadIdx.x;
 
-    // Float reciprocals for pixel normalization
-    float invWidth = 1.f / imgW;
-    float invHeight = 1.f / imgH;
+    // A tile near the image edge might only be, say, 7 pixels wide instead of 16.
+    // If we directly loop px += blockDim.x and guard if (px < endX)
+    // some threads would skip the body and thus miss the syncthreads call
+    // that comes after the loads.
+    // Thus, we precompute the max steps that all threads in this block
+    // need to iterate through.
+    const int spanX  = endX - startX;
+    const int spanY  = endY - startY;
+    const int stepsX = (spanX + blockDim.x - 1) / blockDim.x;
+    const int stepsY = (spanY + blockDim.y - 1) / blockDim.y;
 
-    // Loop over pixels with striding
-    for (int py = startY + threadIdx.y; py < endY; py += blockDim.y) {
-        for (int px = startX + threadIdx.x; px < endX; px += blockDim.x) {
-            // Process blockDim.x by blockDim.y window in current tile.
+    const bool isSnow =
+        (cuConstRendererParams.sceneName == SNOWFLAKES) ||
+        (cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME);
 
-            // Normalized pixel center
-            // Y = 0 is the bottom of the image
-            float2 pixelCenter = make_float2(
-                invWidth * (px + 0.5f),
-                invHeight * (py + 0.5f)
-            );
+    const float invW = 1.f / imgW;
+    const float invH = 1.f / imgH;
 
-            // Pointer to pixel RGBA
-            float4* imagePtr = (float4*)(&cuConstRendererParams.imageData[4 * (py * imgW + px)]);
+    for (int sy = 0; sy < stepsY; ++sy) {
+        // Calculate y pixel value for this tile and thread.
+        const int py = startY + threadIdx.y + sy * blockDim.y;
 
-            // Accumulator to prevent constant global writes
-            float4 acc = make_float4(imagePtr->x, imagePtr->y, imagePtr->z, imagePtr->w);
+        for (int sx = 0; sx < stepsX; ++sx) {
+            // Calculate x pixel value for this tile and thread.
+            const int px = startX + threadIdx.x + sx * blockDim.x;
 
-            // Walk circles in shared-memory chunks
-            for (int k0 = 0; k0 < count; k0 += CIRC_CHUNK) {
-                const int todo = min(CIRC_CHUNK, count - k0);
+            // Per-pixel state (only for valid pixels)
+            float4 acc;
+            float2 pixelCenter;
+            float4* imagePtr = nullptr;
+            if (px < endX && py < endY) {
+                // Initialize accumulator pixel
+                imagePtr = (float4*)(&cuConstRendererParams.imageData[4 * (py * imgW + px)]);
+                acc = make_float4(imagePtr->x, imagePtr->y, imagePtr->z, imagePtr->w);
+                pixelCenter = make_float2((px + 0.5f) * invW, (py + 0.5f) * invH);
+            }
 
-                // Load indices first (strided by lanes)
-                for (int t = lane; t < todo; t += lanes) {
-                    const int circleIdx = indexOrderMap[base + k0 + t];
-                    const float3 p = *(const float3*)(&cuConstRendererParams.position[3 * circleIdx]);
-                    sh_px[t] = p.x;
-                    sh_py[t] = p.y;
-                    sh_pz[t] = p.z;
-                    sh_r[t]  = cuConstRendererParams.radius[circleIdx];
+            // Instead of processing every single circle for this pixel,
+            // we will load CIRC_CHUNK circles at a time into shared memory for all
+            // threads in this block / tile to use together (as the circle order
+            // is the same within this block). 
+            // Then, we can render CIRC_CHUNK circles at a time for pixels within
+            // this tile.
+            for (int circleChunkIdx = 0; circleChunkIdx < circleCount; circleChunkIdx += CIRC_CHUNK) {
+                // Circles to process in THIS chunk.
+                // This exists because the last chunk will likely have less than
+                // CIRC_CHUNK numbers.
+                const int circlesToProcess = min(CIRC_CHUNK, circleCount - circleChunkIdx);
+                
+                // If valid lane (not out of index)
+                if (lane < circlesToProcess) {
+                    // Get circle ID that this thread is responsible for
+                    // copying over to shared memory.
+                    const int cid = indexOrderMap[base + circleChunkIdx + lane];
+                    sh_idx[lane] = cid;
+                    stageCircleToShared(lane, cid, sh_px, sh_py, sh_pz, sh_r, sh_cr, sh_cg, sh_cb, isSnow);
                 }
                 __syncthreads();
 
-                // Render circles
-                for (int t = 0; t < todo; ++t) {
-                    const float3 p = make_float3(sh_px[t], sh_py[t], sh_pz[t]);
-                    // NOTE: we still need the circle index for color in non-snow scenes.
-                    // We can either reload it or stage it too. To avoid another shared array,
-                    // just reload the ID (one integer read from global; cheap).
-                    const int circleIdx = indexOrderMap[base + k0 + t];
-                    const float rad = sh_r[t];
-                    shadePixelAcc(pixelCenter, p, rad, acc, circleIdx);
+                // Consume staged circles
+                if (px < endX && py < endY) {
+                    #pragma unroll 4
+                    for (int t = 0; t < circlesToProcess; ++t) {
+                        shadePixelSharedMem(
+                            pixelCenter, acc, t,
+                            sh_px, sh_py, sh_pz, sh_r, sh_cr, sh_cg, sh_cb,
+                            isSnow
+                        );
+                    }
                 }
                 __syncthreads();
             }
 
-            *imagePtr = acc;
+            if (px < endX && py < endY) {
+                *imagePtr = acc;
+            }
         }
     }
 }
@@ -939,6 +1034,8 @@ void CudaRenderer::chunkedPrefixSum(int* d_orderMap, int rowLength, int rowLengt
 
 void
 CudaRenderer::setup() {
+    // This is a hard requirement, given how our kernel is currently written.
+    static_assert(BLOCK_SIZE >= CIRC_CHUNK, "BLOCK_SIZE must be >= CIRC_CHUNK");
 
     int deviceCount = 0;
     bool isFastGPU = false;
@@ -1274,9 +1371,9 @@ void CudaRenderer::render() {
                                             /*rowLengthPadded=*/ROW_PADDED);
     
 
-    dim3 blockTile(16, 16); // Block size is still 256 here, just 2d for easier math.
+    dim3 blockTile(32, 32); // Block size is still 1024 here, just 2d for easier math.
     dim3 gridTiles(tilesPerWidth, tilesPerHeight); // We deploy a block per tile.
-    size_t circleSharedMemBytes = (size_t)(4 * CIRC_CHUNK) * sizeof(float);
+    size_t circleSharedMemBytes = (size_t)(8 * CIRC_CHUNK) * sizeof(float);
 
     kernelRenderTiles<<<gridTiles, blockTile, circleSharedMemBytes>>>(cudaDeviceIndexOrderMap,
                                                 cudaDeviceCounts,
