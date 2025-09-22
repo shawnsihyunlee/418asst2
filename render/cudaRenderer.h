@@ -7,6 +7,12 @@
 
 #include "circleRenderer.h"
 
+struct Box {
+    float boxL;
+    float boxR;
+    float boxT;
+    float boxB;
+};
 
 class CudaRenderer : public CircleRenderer {
 
@@ -27,6 +33,21 @@ private:
     float* cudaDeviceRadius;
     float* cudaDeviceImageData;
 
+    // TODO: check if everything is initialized correctly in the constructor
+    int *cudaDeviceIndexOrderMap;  // compressed per-pixel circle indices
+    int *cudaDeviceCounts;         // per-pixel counts
+    int *d_orderMap;
+    int  numCirclesPadded;
+    int  numPixels;
+
+    int imageWidth;
+    int imageHeight;
+
+    int tileSize = 128;
+    int tilesPerWidth;
+    int tilesPerHeight;
+    int numTiles;
+
 public:
 
     CudaRenderer();
@@ -43,6 +64,23 @@ public:
     void clearImage();
 
     void advanceAnimation();
+
+    void chunkedPrefixSum(int*, int, int);
+
+    void debugPrintOrderMapTile(const int* d_orderMap,
+                                int tile,
+                                int numCircles,
+                                int numCirclesPadded,
+                                int maxColsToPrint /* e.g., 128 or numCircles */);
+
+    void debugPrintCompressedTile(const int* d_indexOrderMap,
+                                            const int* d_counts,
+                                            int tile,
+                                            int maxToPrint /* e.g., 64 */);
+
+    void debugPrintCompressedAll(const int* d_indexOrderMap,
+                                           const int* d_counts,
+                                           int maxToPrintPerTile /* e.g., 64 */);
 
     void render();
 
