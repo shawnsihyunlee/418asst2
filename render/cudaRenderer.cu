@@ -18,6 +18,7 @@
 #include "util.h"
 
 #define BLOCK_SIZE 1024
+#define CIRC_CHUNK 256
 
 // Number of threads in a block
 #define SCAN_BLOCK_DIM BLOCK_SIZE
@@ -460,13 +461,12 @@ shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, int circleIndex) {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
-shadePixelAcc(float2 pixelCenter, float3 p, float4& acc, int circleIndex) {
+shadePixelAcc(float2 pixelCenter, const float3 p, const float rad, float4& acc, int circleIndex) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
     float maxDist = rad * rad;
 
     // Circle does not contribute to the image
@@ -759,6 +759,24 @@ __global__ void kernelRenderTiles(const int* __restrict__ indexOrderMap,
     const int endX   = min(startX + tileSize, imgW); // exclusive
     const int endY   = min(startY + tileSize, imgH); // exclusive
 
+    // How many circles overlap this tile? If zero, we can skip.
+    const int count = counts[tile];
+    if (count <= 0) return;
+
+    // Base of this tile's circle indices.
+    const int base = tile * numCircles;
+
+    // Shared memory layout: px[C], py[C], pz[C], rad[C]
+    extern __shared__ float shmem[];
+    float* sh_px = shmem;
+    float* sh_py = sh_px + CIRC_CHUNK;
+    float* sh_pz = sh_py + CIRC_CHUNK;
+    float* sh_r  = sh_pz + CIRC_CHUNK;
+
+    // Flattened thread id in the block to help with cooperative loads
+    const int lane = threadIdx.y * blockDim.x + threadIdx.x;
+    const int lanes = blockDim.x * blockDim.y;
+
     // Float reciprocals for pixel normalization
     float invWidth = 1.f / imgW;
     float invHeight = 1.f / imgH;
@@ -778,22 +796,35 @@ __global__ void kernelRenderTiles(const int* __restrict__ indexOrderMap,
             // Pointer to pixel RGBA
             float4* imagePtr = (float4*)(&cuConstRendererParams.imageData[4 * (py * imgW + px)]);
 
-            // How many circles overlap this tile? If zero, we can skip.
-            const int count = counts[tile];
-            if (count <= 0) continue;
-
-            // Base of this tile's circle indices.
-            const int base = tile * numCircles;
-
             // Accumulator to prevent constant global writes
             float4 acc = make_float4(imagePtr->x, imagePtr->y, imagePtr->z, imagePtr->w);
 
-            // Accumulate this pixel over relevant circles
-            for (int k = 0; k < count; ++k) {
-                const int circleIdx = indexOrderMap[base + k];
-                // Load circle center (xyz) and shade; shadePixel will early-out if outside radius
-                const float3 p = *(const float3*)(&cuConstRendererParams.position[3 * circleIdx]);
-                shadePixelAcc(pixelCenter, p, acc, circleIdx);
+            // Walk circles in shared-memory chunks
+            for (int k0 = 0; k0 < count; k0 += CIRC_CHUNK) {
+                const int todo = min(CIRC_CHUNK, count - k0);
+
+                // Load indices first (strided by lanes)
+                for (int t = lane; t < todo; t += lanes) {
+                    const int circleIdx = indexOrderMap[base + k0 + t];
+                    const float3 p = *(const float3*)(&cuConstRendererParams.position[3 * circleIdx]);
+                    sh_px[t] = p.x;
+                    sh_py[t] = p.y;
+                    sh_pz[t] = p.z;
+                    sh_r[t]  = cuConstRendererParams.radius[circleIdx];
+                }
+                __syncthreads();
+
+                // Render circles
+                for (int t = 0; t < todo; ++t) {
+                    const float3 p = make_float3(sh_px[t], sh_py[t], sh_pz[t]);
+                    // NOTE: we still need the circle index for color in non-snow scenes.
+                    // We can either reload it or stage it too. To avoid another shared array,
+                    // just reload the ID (one integer read from global; cheap).
+                    const int circleIdx = indexOrderMap[base + k0 + t];
+                    const float rad = sh_r[t];
+                    shadePixelAcc(pixelCenter, p, rad, acc, circleIdx);
+                }
+                __syncthreads();
             }
 
             *imagePtr = acc;
@@ -1245,8 +1276,9 @@ void CudaRenderer::render() {
 
     dim3 blockTile(16, 16); // Block size is still 256 here, just 2d for easier math.
     dim3 gridTiles(tilesPerWidth, tilesPerHeight); // We deploy a block per tile.
+    size_t circleSharedMemBytes = (size_t)(4 * CIRC_CHUNK) * sizeof(float);
 
-    kernelRenderTiles<<<gridTiles, blockTile>>>(cudaDeviceIndexOrderMap,
+    kernelRenderTiles<<<gridTiles, blockTile, circleSharedMemBytes>>>(cudaDeviceIndexOrderMap,
                                                 cudaDeviceCounts,
                                                 numberOfCircles);
     cudaFree(d_orderMap);
