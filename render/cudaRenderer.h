@@ -43,7 +43,7 @@ private:
     int imageWidth;
     int imageHeight;
 
-    int tileSize = 128;
+    int tileSize = 64;
     int tilesPerWidth;
     int tilesPerHeight;
     int numTiles;

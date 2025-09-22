@@ -454,6 +454,67 @@ shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, int circleIndex) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
+// shadePixel -- (CUDA device code)
+//
+// Given a pixel and a circle, determine the contribution to the
+// pixel from the circle.  Update of the image is done in this
+// function.  Called by kernelRenderCircles()
+__device__ __inline__ void
+shadePixelAcc(float2 pixelCenter, float3 p, float4& acc, int circleIndex) {
+
+    float diffX = p.x - pixelCenter.x;
+    float diffY = p.y - pixelCenter.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    float rad = cuConstRendererParams.radius[circleIndex];;
+    float maxDist = rad * rad;
+
+    // Circle does not contribute to the image
+    if (pixelDist > maxDist)
+        return;
+
+    float3 rgb;
+    float alpha;
+
+    // There is a non-zero contribution.  Now compute the shading value
+
+    // Suggestion: This conditional is in the inner loop.  Although it
+    // will evaluate the same for all threads, there is overhead in
+    // setting up the lane masks, etc., to implement the conditional.  It
+    // would be wise to perform this logic outside of the loops in
+    // kernelRenderCircles.  (If feeling good about yourself, you
+    // could use some specialized template magic).
+    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
+
+        const float kCircleMaxAlpha = .5f;
+        const float falloffScale = 4.f;
+
+        float normPixelDist = sqrt(pixelDist) / rad;
+        rgb = lookupColor(normPixelDist);
+
+        float maxAlpha = .6f + .4f * (1.f-p.z);
+        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+        alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+
+    } else {
+        // Simple: each circle has an assigned color
+        int index3 = 3 * circleIndex;
+        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+        alpha = .5f;
+    }
+
+    float oneMinusAlpha = 1.f - alpha;
+
+    // BEGIN SHOULD-BE-ATOMIC REGION
+
+    acc.x = alpha * rgb.x + oneMinusAlpha * acc.x;
+    acc.y = alpha * rgb.y + oneMinusAlpha * acc.y;
+    acc.z = alpha * rgb.z + oneMinusAlpha * acc.z;
+    acc.w = alpha + acc.w;
+
+    // END SHOULD-BE-ATOMIC REGION
+}
+
 // kernelRenderCircles -- (CUDA device code)
 //
 // Each thread renders a circle.  Since there is no protection to
@@ -724,14 +785,18 @@ __global__ void kernelRenderTiles(const int* __restrict__ indexOrderMap,
             // Base of this tile's circle indices.
             const int base = tile * numCircles;
 
+            // Accumulator to prevent constant global writes
+            float4 acc = make_float4(imagePtr->x, imagePtr->y, imagePtr->z, imagePtr->w);
+
             // Accumulate this pixel over relevant circles
             for (int k = 0; k < count; ++k) {
                 const int circleIdx = indexOrderMap[base + k];
-
                 // Load circle center (xyz) and shade; shadePixel will early-out if outside radius
                 const float3 p = *(const float3*)(&cuConstRendererParams.position[3 * circleIdx]);
-                shadePixel(pixelCenter, p, imagePtr, circleIdx);
+                shadePixelAcc(pixelCenter, p, acc, circleIdx);
             }
+
+            *imagePtr = acc;
         }
     }
 }
@@ -1156,8 +1221,6 @@ void CudaRenderer::render() {
 
     // Get EPS using ES with chunking
     chunkedPrefixSum(d_orderMap, ROW_LEN, ROW_PADDED);
-
-
 
     // Compress order bit vectors into concrete circle indices
     cudaCheckError(cudaMalloc(&cudaDeviceIndexOrderMap, sizeof(int) * numTiles * numberOfCircles));
