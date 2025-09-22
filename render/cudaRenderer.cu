@@ -17,7 +17,7 @@
 #include "sceneLoader.h"
 #include "util.h"
 
-// These two need to be equal.
+// Circle chunk size should be less than block size.
 #define BLOCK_SIZE 1024
 #define CIRC_CHUNK 256
 
@@ -110,7 +110,7 @@ int nextPow2(int n)
     return n;
 }
 
-__device__
+__device__ inline
 Box getBoundingBoxOfTile(int tileIdx) {
 
     float invWidth = 1.f / cuConstRendererParams.imageWidth;
@@ -657,20 +657,75 @@ __global__ void kernelOrderCircles(int* orderMap, int rowLengthPadded, int numTi
     float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
     float  rad = cuConstRendererParams.radius[gid];
 
-    // Iterate through all tiles and see which ones are intersecting
-    for (int i = 0; i < numTiles; i++){
-        Box bb = getBoundingBoxOfTile(i);
-        // do fast check first
-        if (!circleInBoxConservative(p.x, p.y, rad, bb.boxL, bb.boxR, bb.boxT, bb.boxB)) {
-            continue;
+    // Compute the bounding box of the circle.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short minX = static_cast<short>(imageWidth * (p.x - rad));
+    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+    short minY = static_cast<short>(imageHeight * (p.y - rad));
+    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+    // Convert to tile ranges
+    const int tileMinX = screenMinX / cuConstRendererParams.tileSize;
+    const int tileMaxX = screenMaxX / cuConstRendererParams.tileSize;
+    const int tileMinY = screenMinY / cuConstRendererParams.tileSize;
+    const int tileMaxY = screenMaxY / cuConstRendererParams.tileSize;
+
+    // Iterate through tiles in bounding box, see which ones are intersecting
+    for (int tx = tileMinX; tx <= tileMaxX; tx++) {
+        for (int ty = tileMinY; ty <= tileMaxY; ty++) {
+            // Calculate absolute tile index 
+            int i = ty * cuConstRendererParams.tilesPerWidth + tx;
+            Box bb = getBoundingBoxOfTile(i);
+            // do fast check first
+            if (!circleInBoxConservative(p.x, p.y, rad, bb.boxL, bb.boxR, bb.boxT, bb.boxB)) {
+                continue;
+            }
+            // Now do actual check
+            if (!circleInBox(p.x, p.y, rad, bb.boxL, bb.boxR, bb.boxT, bb.boxB)) {
+                continue;
+            }
+            // If we're here, this means this circle contributes to this tile.
+            // For Chris: gid = circle ID
+            orderMap[i * rowLengthPadded + gid] = 1;
         }
-        // Now do actual check
-        if (!circleInBox(p.x, p.y, rad, bb.boxL, bb.boxR, bb.boxT, bb.boxB)) {
-            continue;
-        }
-        // If we're here, this means this circle contributes to this tile.
-        // For Chris: gid = circle ID
-        orderMap[i * rowLengthPadded + gid] = 1;
+    }
+}
+
+__global__ void kernelScanSingleBlockRows(const int* __restrict__ d_in,
+                                          int* __restrict__ d_out,
+                                          int rowLength,
+                                          int rowLengthPadded)
+{
+    const int tile = blockIdx.x;
+    const int tid  = threadIdx.x;
+
+    const int base = tile * rowLengthPadded;
+
+    extern __shared__ int sMem[];
+    int* sInput   = sMem;
+    int* sOutput  = sInput + blockDim.x;
+    int* sScratch = sOutput + blockDim.x;
+
+    int val = 0;
+    if (tid < rowLength) val = d_in[base + tid];
+    sInput[tid] = val;
+    __syncthreads();
+
+    sharedMemExclusiveScan(tid,
+                           (uint*)sInput,
+                           (uint*)sOutput,
+                           (uint*)sScratch,
+                           blockDim.x);
+    __syncthreads();
+
+    // Store only the valid part (rowLength entries, including the sentinel slot)
+    if (tid < rowLength) {
+        d_out[base + tid] = sOutput[tid];
     }
 }
 
@@ -975,6 +1030,12 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
     }
+
+    if (d_orderMap) {
+        cudaFree(d_orderMap);
+        cudaFree(cudaDeviceIndexOrderMap);
+        cudaFree(cudaDeviceCounts);
+    }
 }
 
 const Image*
@@ -1000,6 +1061,18 @@ CudaRenderer::loadScene(SceneName scene) {
 }
 
 void CudaRenderer::chunkedPrefixSum(int* d_orderMap, int rowLength, int rowLengthPadded) {
+    if (rowLengthPadded <= SCAN_BLOCK_DIM) {
+        // Fast path: whole row fits in a single block → one pass, one block per tile
+        dim3 grid(numTiles);
+        dim3 block(SCAN_BLOCK_DIM);
+        size_t shmem = (4 * SCAN_BLOCK_DIM) * sizeof(int);
+        kernelScanSingleBlockRows<<<grid, block, shmem>>>(d_orderMap, d_orderMap,
+                                                          rowLength, rowLengthPadded);
+        cudaCheckError(cudaDeviceSynchronize());
+        return;
+    }
+
+    // Normal chunked slow path
     int numChunksPerTile = (rowLengthPadded + SCAN_BLOCK_DIM - 1) / SCAN_BLOCK_DIM;
 
     // Device buffers
@@ -1140,6 +1213,13 @@ CudaRenderer::setup() {
         {.8f, .9f, 1.f},
         {.8f, 0.8f, 1.f},
     };
+
+    // Malloc necessary arrays to use in render
+    const int ROW_LEN = numberOfCircles + 1;
+    const int ROW_PADDED = nextPow2(ROW_LEN);
+    cudaCheckError(cudaMalloc(&d_orderMap, sizeof(int) * numTiles * ROW_PADDED));
+    cudaCheckError(cudaMalloc(&cudaDeviceIndexOrderMap, sizeof(int) * numTiles * numberOfCircles));
+    cudaCheckError(cudaMalloc(&cudaDeviceCounts, sizeof(int) * numTiles));
 
     cudaMemcpyToSymbol(cuConstColorRamp, lookupTable, sizeof(float) * 3 * COLOR_MAP_SIZE);
 
@@ -1337,47 +1417,41 @@ void CudaRenderer::debugPrintCompressedAll(const int* d_indexOrderMap,
 void CudaRenderer::render() {
     const int ROW_LEN = numberOfCircles + 1; // Need a sentinel value for exclusive prefix sum
     const int ROW_PADDED = nextPow2(ROW_LEN);
-    int *d_orderMap;
-    cudaCheckError(cudaMalloc(&d_orderMap, sizeof(int) * numTiles * ROW_PADDED));
     cudaCheckError(cudaMemset(d_orderMap, 0, sizeof(int) * numTiles * ROW_PADDED));
 
-    // Initialize order map
+    // ------------------------- Phase 1: mark tiles per circle -------------------------
     int threadsPerBlock = BLOCK_SIZE;
-    int numBlocks = (ROW_PADDED + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int numBlocks = (numberOfCircles + BLOCK_SIZE - 1) / BLOCK_SIZE;
     kernelOrderCircles<<<numBlocks, threadsPerBlock>>>(d_orderMap, ROW_PADDED, numTiles);
-    cudaCheckError(cudaDeviceSynchronize());
 
-    // Get EPS using ES with chunking
+    // ------------------------- Phase 2: per-tile exclusive scans (chunked) ------------
     chunkedPrefixSum(d_orderMap, ROW_LEN, ROW_PADDED);
 
-    // Compress order bit vectors into concrete circle indices
-    cudaCheckError(cudaMalloc(&cudaDeviceIndexOrderMap, sizeof(int) * numTiles * numberOfCircles));
-    cudaCheckError(cudaMalloc(&cudaDeviceCounts, sizeof(int) * numTiles));
+    // ------------------------- Phase 3: compress indices ------------------------------
+
     // Memset to -1 and 0 each respectively.
     cudaCheckError(cudaMemset(cudaDeviceIndexOrderMap, 0xFF,
                           sizeof(int) * numTiles * numberOfCircles));
     cudaCheckError(cudaMemset(cudaDeviceCounts, 0, sizeof(int) * numTiles));
 
-    // // Choose a reasonable tile for circles (no need for 1024 here)
     dim3 block(BLOCK_SIZE);
     dim3 grid((numberOfCircles + BLOCK_SIZE - 1) / BLOCK_SIZE,  // over circles
-            numTiles);                                            // over tiles
-              // over pixels
+              numTiles);                                        // over tiles
 
     kernelCompressIndices<<<grid, block>>>(d_orderMap,
-                                            cudaDeviceIndexOrderMap,
-                                            cudaDeviceCounts,
-                                            /*numberOfCircles=*/numberOfCircles,
-                                            /*rowLengthPadded=*/ROW_PADDED);
-    
+                                           cudaDeviceIndexOrderMap,
+                                           cudaDeviceCounts,
+                                           /*numberOfCircles=*/numberOfCircles,
+                                           /*rowLengthPadded=*/ROW_PADDED);
+
+    // ------------------------- Phase 4: render tiles ----------------------------------
 
     dim3 blockTile(32, 32); // Block size is still 1024 here, just 2d for easier math.
     dim3 gridTiles(tilesPerWidth, tilesPerHeight); // We deploy a block per tile.
     size_t circleSharedMemBytes = (size_t)(8 * CIRC_CHUNK) * sizeof(float);
 
-    kernelRenderTiles<<<gridTiles, blockTile, circleSharedMemBytes>>>(cudaDeviceIndexOrderMap,
-                                                cudaDeviceCounts,
-                                                numberOfCircles);
-    cudaFree(d_orderMap);
+    kernelRenderTiles<<<gridTiles, blockTile, circleSharedMemBytes>>>(
+        cudaDeviceIndexOrderMap, cudaDeviceCounts, numberOfCircles);
+
     cudaCheckError(cudaDeviceSynchronize());
 }
