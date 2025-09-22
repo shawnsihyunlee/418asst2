@@ -118,14 +118,14 @@ Box getBoundingBoxOfTile(int tileIdx) {
     int tileY = tileIdx / cuConstRendererParams.tilesPerWidth;
     int pixL = tileX * cuConstRendererParams.tileSize;
     int pixR = min((tileX + 1) * cuConstRendererParams.tileSize, cuConstRendererParams.imageWidth) - 1;
-    int pixT = tileY * cuConstRendererParams.tileSize;
-    int pixB = min((tileY + 1) * cuConstRendererParams.tileSize, cuConstRendererParams.imageHeight) - 1;
+    int pixT = min((tileY + 1) * cuConstRendererParams.tileSize, cuConstRendererParams.imageHeight) - 1;
+    int pixB =  tileY * cuConstRendererParams.tileSize;
 
     Box box = {
         .boxL = invWidth * (static_cast<float>(pixL) + 0.5f),
         .boxR = invWidth * (static_cast<float>(pixR) + 0.5f),
-        .boxT = 1 - invHeight * (static_cast<float>(pixT) + 0.5f),
-        .boxB = 1 - invHeight * (static_cast<float>(pixB) + 0.5f)
+        .boxT = invHeight * (static_cast<float>(pixT) + 0.5f),
+        .boxB = invHeight * (static_cast<float>(pixB) + 0.5f)
     };
 
     return box;
@@ -711,7 +711,7 @@ __global__ void kernelRenderTiles(const int* __restrict__ indexOrderMap,
             // Y = 0 is the bottom of the image
             float2 pixelCenter = make_float2(
                 invWidth * (px + 0.5f),
-                1.f - invHeight * (py + 0.5f)
+                invHeight * (py + 0.5f)
             );
 
             // Pointer to pixel RGBA
