@@ -389,133 +389,10 @@ __global__ void kernelAdvanceSnowflake() {
     *((float3*)velocityPtr) = velocity;
 }
 
-// shadePixel -- (CUDA device code)
-//
-// Given a pixel and a circle, determine the contribution to the
-// pixel from the circle.  Update of the image is done in this
-// function.  Called by kernelRenderCircles()
-__device__ __inline__ void
-shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, int circleIndex) {
+/************************* Kernel Helper Functions *********************/
 
-    float diffX = p.x - pixelCenter.x;
-    float diffY = p.y - pixelCenter.y;
-    float pixelDist = diffX * diffX + diffY * diffY;
-
-    float rad = cuConstRendererParams.radius[circleIndex];;
-    float maxDist = rad * rad;
-
-    // Circle does not contribute to the image
-    if (pixelDist > maxDist)
-        return;
-
-    float3 rgb;
-    float alpha;
-
-    // There is a non-zero contribution.  Now compute the shading value
-
-    // Suggestion: This conditional is in the inner loop.  Although it
-    // will evaluate the same for all threads, there is overhead in
-    // setting up the lane masks, etc., to implement the conditional.  It
-    // would be wise to perform this logic outside of the loops in
-    // kernelRenderCircles.  (If feeling good about yourself, you
-    // could use some specialized template magic).
-    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
-
-        const float kCircleMaxAlpha = .5f;
-        const float falloffScale = 4.f;
-
-        float normPixelDist = sqrt(pixelDist) / rad;
-        rgb = lookupColor(normPixelDist);
-
-        float maxAlpha = .6f + .4f * (1.f-p.z);
-        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
-        alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-
-    } else {
-        // Simple: each circle has an assigned color
-        int index3 = 3 * circleIndex;
-        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
-        alpha = .5f;
-    }
-
-    float oneMinusAlpha = 1.f - alpha;
-
-    // BEGIN SHOULD-BE-ATOMIC REGION
-    // global memory read
-
-    float4 existingColor = *imagePtr;
-    float4 newColor;
-    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
-    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
-    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
-    newColor.w = alpha + existingColor.w;
-
-    // Global memory write
-    *imagePtr = newColor;
-
-    // END SHOULD-BE-ATOMIC REGION
-}
-
-// shadePixel -- (CUDA device code)
-//
-// Given a pixel and a circle, determine the contribution to the
-// pixel from the circle.  Update of the image is done in this
-// function.  Called by kernelRenderCircles()
-__device__ __inline__ void
-shadePixelAcc(float2 pixelCenter, const float3 p, const float rad, float4& acc, int circleIndex) {
-
-    float diffX = p.x - pixelCenter.x;
-    float diffY = p.y - pixelCenter.y;
-    float pixelDist = diffX * diffX + diffY * diffY;
-
-    float maxDist = rad * rad;
-
-    // Circle does not contribute to the image
-    if (pixelDist > maxDist)
-        return;
-
-    float3 rgb;
-    float alpha;
-
-    // There is a non-zero contribution.  Now compute the shading value
-
-    // Suggestion: This conditional is in the inner loop.  Although it
-    // will evaluate the same for all threads, there is overhead in
-    // setting up the lane masks, etc., to implement the conditional.  It
-    // would be wise to perform this logic outside of the loops in
-    // kernelRenderCircles.  (If feeling good about yourself, you
-    // could use some specialized template magic).
-    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
-
-        const float kCircleMaxAlpha = .5f;
-        const float falloffScale = 4.f;
-
-        float normPixelDist = sqrt(pixelDist) / rad;
-        rgb = lookupColor(normPixelDist);
-
-        float maxAlpha = .6f + .4f * (1.f-p.z);
-        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
-        alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-
-    } else {
-        // Simple: each circle has an assigned color
-        int index3 = 3 * circleIndex;
-        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
-        alpha = .5f;
-    }
-
-    float oneMinusAlpha = 1.f - alpha;
-
-    // BEGIN SHOULD-BE-ATOMIC REGION
-
-    acc.x = alpha * rgb.x + oneMinusAlpha * acc.x;
-    acc.y = alpha * rgb.y + oneMinusAlpha * acc.y;
-    acc.z = alpha * rgb.z + oneMinusAlpha * acc.z;
-    acc.w = alpha + acc.w;
-
-    // END SHOULD-BE-ATOMIC REGION
-}
-
+// Moves a circle's attributes to the shared memory pointers
+// passed in as arguments.
 __device__ __inline__ void stageCircleToShared(
     int lane, int cid,
     float* sh_px, float* sh_py, float* sh_pz, float* sh_r,
@@ -536,6 +413,8 @@ __device__ __inline__ void stageCircleToShared(
     }
 }
 
+// Shades a pixel according to a circle using the shading algorithm,
+// using values in shared memory.
 __device__ __inline__ void shadePixelSharedMem(
     const float2& pixelCenter,
     float4& acc,
@@ -576,54 +455,6 @@ __device__ __inline__ void shadePixelSharedMem(
     acc.w = alpha + acc.w;
 }
 
-// kernelRenderCircles -- (CUDA device code)
-//
-// Each thread renders a circle.  Since there is no protection to
-// ensure order of update or mutual exclusion on the output image, the
-// resulting image will be incorrect.
-__global__ void kernelRenderCircles() {
-
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (index >= cuConstRendererParams.numberOfCircles)
-        return;
-
-    int index3 = 3 * index;
-
-    // Read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
-
-    // Compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-    // A bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
-
-    // For all pixels in the bounding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(pixelCenterNorm, p, imgPtr, index);
-            imgPtr++;
-        }
-    }
-}
-
 // Helper function that tells us if a pixel center is inside
 // a circle at position p and circleIndex.
 __device__ bool isInCircle(float2 pixelCenter, float3 p, int circleIndex) {
@@ -645,7 +476,18 @@ __device__ int get3dIdx(int x, int y, int z, int xDim, int yDim, int zDim) {
     return z + y * zDim + x * (yDim * zDim);
 }
 
-// Orders circles.
+/************************* Renderer Kernels ****************************/
+
+/**
+ * @brief Stage 1 of the tiled circle rendering pipeline: mark circle–tile intersections.
+ *
+ * This kernel will create a mapping from tiles to a one-hot vector, where orderMap[tileId][idx]
+ * means that circle `idx` is present in tile `tileId`.
+ * The outputted orderMap is in tile-major order, where each one-hot vector is of length
+ * rowLengthPadded.
+ * The kernel expects rowLengthPadded to be (numCircles + 1) padded, due to the 
+ * sentinel element at the end.
+ */
 __global__ void kernelOrderCircles(int* orderMap, int rowLengthPadded, int numTiles) {
     int gid = blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= cuConstRendererParams.numberOfCircles)
@@ -696,6 +538,9 @@ __global__ void kernelOrderCircles(int* orderMap, int rowLengthPadded, int numTi
     }
 }
 
+/**
+ * @brief Exclusive prefix sum kernel for when rowLengthPadded <= SCAN_BLOCK_SIZE.
+ */
 __global__ void kernelScanSingleBlockRows(const int* __restrict__ d_in,
                                           int* __restrict__ d_out,
                                           int rowLength,
@@ -729,6 +574,9 @@ __global__ void kernelScanSingleBlockRows(const int* __restrict__ d_in,
     }
 }
 
+/**
+ * @brief Exclusive prefix sum kernel that scans one chunk of a long array.
+ */
 __global__ void kernelScanChunks(const int* d_in,
                                  int* d_out,
                                  int* d_chunkTotals,
@@ -775,6 +623,9 @@ __global__ void kernelScanChunks(const int* d_in,
     }
 }
 
+/**
+ * @brief Exclusive prefix sum kernel that takes chunk totals from kernalScanChunks.
+ */
 __global__ void kernelScanChunkTotals(int* d_chunkTotals,
                                       int numChunksPerTile) {
     int tile = blockIdx.x;
@@ -807,6 +658,9 @@ __global__ void kernelScanChunkTotals(int* d_chunkTotals,
     }
 }
 
+/**
+ * @brief Exclusive prefix sum kernel that adds back offsets of chunks.
+ */
 __global__ void kernelAddOffsets(int* d_out,
                                  const int* d_chunkOffsets,
                                  int rowLength,
@@ -824,9 +678,15 @@ __global__ void kernelAddOffsets(int* d_out,
     }
 }
 
-// prefix:  [numTiles x ROW_PADDED] exclusive scan, per tile, over ROW_LEN columns
-// outIdx:  [numTiles x numberOfCircles] packed circle indices per tile
-// counts:  [numTiles] total kept per tile (read from sentinel = prefix[base + numCircles])
+/**
+ * @brief Kernel that compresses a exclusive-prefix-summed one-hot vector into
+ * a shorter array that contains the sorted indices of the 1-positions in the
+ * one-hot vector.
+ *
+ * prefix:  [numTiles x ROW_PADDED] exclusive scan, per tile, over ROW_LEN columns
+ * outIdx:  [numTiles x numberOfCircles] packed circle indices per tile
+ * counts:  [numTiles] total kept per tile (read from sentinel = prefix[base + numCircles])
+ */
 __global__ void kernelCompressIndices(const int* __restrict__ prefix,
                                            int* __restrict__ outIdx,
                                            int* __restrict__ counts,
@@ -856,6 +716,9 @@ __global__ void kernelCompressIndices(const int* __restrict__ prefix,
     }
 }
 
+/**
+ * @brief Kernel for rendering within one tile.
+ */
 __global__ void kernelRenderTiles(const int* __restrict__ indexOrderMap,
                                   const int* __restrict__ counts,
                                   int numCircles)
@@ -913,6 +776,7 @@ __global__ void kernelRenderTiles(const int* __restrict__ indexOrderMap,
     const int stepsX = (spanX + blockDim.x - 1) / blockDim.x;
     const int stepsY = (spanY + blockDim.y - 1) / blockDim.y;
 
+    // Precompute this conditional to save compiler branching
     const bool isSnow =
         (cuConstRendererParams.sceneName == SNOWFLAKES) ||
         (cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME);
@@ -975,6 +839,7 @@ __global__ void kernelRenderTiles(const int* __restrict__ indexOrderMap,
                 __syncthreads();
             }
 
+            // Finally, write back to global memory.
             if (px < endX && py < endY) {
                 *imagePtr = acc;
             }
@@ -1281,139 +1146,7 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
-// void incorrectRender() {
-//     // 256 threads per block is a healthy number
-//     dim3 blockDim(256, 1);
-//     dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
-
-//     kernelRenderCircles<<<gridDim, blockDim>>>();
-//     cudaDeviceSynchronize();
-// }
-
-/* 
- * PRETTY PRINTING FUNCTIONS 
-**/
-
-void CudaRenderer::debugPrintOrderMapTile(const int* d_orderMap,
-                                          int tile,
-                                          int numCircles,
-                                          int rowLengthPadded,
-                                          int maxColsToPrint /* e.g., 128 or numCircles */)
-{
-    if (tile < 0 || tile >= numTiles) {
-        printf("Tile %d out of range [0, %d)\n", tile, numTiles);
-        return;
-    }
-
-    cudaCheckError(cudaDeviceSynchronize());
-
-    std::vector<int> h_row(rowLengthPadded);
-    const size_t rowBytes = static_cast<size_t>(rowLengthPadded) * sizeof(int);
-    cudaCheckError(cudaMemcpy(h_row.data(),
-                              d_orderMap + tile * rowLengthPadded,
-                              rowBytes,
-                              cudaMemcpyDeviceToHost));
-
-    int tileX = tile % tilesPerWidth;
-    int tileY = tile / tilesPerWidth;
-    printf("==== Tile %d (%d,%d) Row ====\n", tile, tileX, tileY);
-
-    int colsToPrint = std::min(numCircles, maxColsToPrint);
-    // print grouped for readability
-    for (int i = 0; i < colsToPrint; i += 32) {
-        int end = std::min(i + 32, colsToPrint);
-        printf("[%4d..%4d): ", i, end);
-        for (int c = i; c < end; ++c) {
-            printf("%d", h_row[c]);
-        }
-        printf("\n");
-    }
-
-    if (colsToPrint < numCircles) {
-        printf("... (%d more columns not shown)\n", numCircles - colsToPrint);
-    }
-    // also show tail of padded region if you care
-    // printf("Padded tail (last 16): ");
-    // for (int c = rowLengthPadded - 16; c < rowLengthPadded; ++c) printf("%d", h_row[c]);
-    // printf("\n");
-
-    printf("=============================\n");
-}
-
-// Pretty-print the compressed index list for a single tile.
-// d_indexOrderMap layout: [numTiles][numberOfCircles] row-major by tile
-// d_counts layout:        [numTiles] (how many valid indices per tile)
-void CudaRenderer::debugPrintCompressedTile(const int* d_indexOrderMap,
-                                            const int* d_counts,
-                                            int tile,
-                                            int maxToPrint /* e.g., 64 */)
-{
-    if (tile < 0 || tile >= numTiles) {
-        printf("Tile %d out of range [0, %d)\n", tile, numTiles);
-        return;
-    }
-
-    // sync before reading
-    cudaCheckError(cudaDeviceSynchronize());
-
-    // pull count
-    int h_count = 0;
-    cudaCheckError(cudaMemcpy(&h_count,
-                              d_counts + tile,
-                              sizeof(int),
-                              cudaMemcpyDeviceToHost));
-    h_count = std::max(0, std::min(h_count, numberOfCircles));
-
-    // nothing in this tile?
-    int tileX = tile % tilesPerWidth;
-    int tileY = tile / tilesPerWidth;
-    printf("==== Compressed indices for Tile %d (%d,%d) ====\n", tile, tileX, tileY);
-    printf("count = %d\n", h_count);
-    if (h_count == 0) {
-        printf("(empty)\n");
-        printf("===============================================\n");
-        return;
-    }
-
-    // pull the first min(h_count, maxToPrint) entries
-    const int toCopy = std::min(h_count, maxToPrint);
-    std::vector<int> h_idx(toCopy);
-    const size_t rowStride = static_cast<size_t>(numberOfCircles);
-    cudaCheckError(cudaMemcpy(h_idx.data(),
-                              d_indexOrderMap + tile * rowStride,
-                              sizeof(int) * toCopy,
-                              cudaMemcpyDeviceToHost));
-
-    // print in small groups for readability
-    for (int i = 0; i < toCopy; i += 16) {
-        int end = std::min(i + 16, toCopy);
-        printf("[%4d..%4d): ", i, end);
-        for (int j = i; j < end; ++j) {
-            printf("%d ", h_idx[j]);
-        }
-        printf("\n");
-    }
-    if (toCopy < h_count) {
-        printf("... (%d more indices not shown)\n", h_count - toCopy);
-    }
-    printf("===============================================\n");
-}
-
-// Convenience: print several (or all) tiles
-void CudaRenderer::debugPrintCompressedAll(const int* d_indexOrderMap,
-                                           const int* d_counts,
-                                           int maxToPrintPerTile /* e.g., 64 */)
-{
-    for (int t = 0; t < numTiles; ++t) {
-        debugPrintCompressedTile(d_indexOrderMap, d_counts, t, maxToPrintPerTile);
-    }
-}
-
-
-/* 
- * PRETTY PRINTING FUNCTIONS END
-**/
-
+// Rendering function. Hot path.
 void CudaRenderer::render() {
     const int ROW_LEN = numberOfCircles + 1; // Need a sentinel value for exclusive prefix sum
     const int ROW_PADDED = nextPow2(ROW_LEN);
