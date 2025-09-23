@@ -11,6 +11,7 @@
 
 #include "CycleTimer.h"
 
+#define BLOCK_SIZE 512
 
 extern float toBW(int bytes, float sec);
 
@@ -29,20 +30,51 @@ static inline int nextPow2(int n)
     return n;
 }
 
+// Upsweep Kernel
+__global__ void
+upsweep_kernel(int* data, int N, int twod) {
+    int twod1 = twod * 2;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = idx * twod1;
+    if (i < N)
+        data[i+twod1-1] += data[i+twod-1];
+    // On the last iteration, we set the last bit to zero. 
+    if (twod * 2 == N && i == 0)
+        data[N-1] = 0;
+}
+
+// Downsweep Kernel
+__global__ void
+downsweep_kernel(int* data, int N, int twod) {
+    int twod1 = twod * 2;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = idx * twod1;
+    if (i < N) {
+        int t = data[i+twod-1];
+        data[i+twod-1] = data[i+twod1-1];
+        data[i+twod1-1] += t;
+    }
+}
+
+
 void exclusive_scan(int* device_data, int length)
 {
-    /* TODO
-     * Fill in this function with your exclusive scan implementation.
-     * You are passed the locations of the data in device memory
-     * The data are initialized to the inputs.  Your code should
-     * do an in-place scan, generating the results in the same array.
-     * This is host code -- you will need to declare one or more CUDA
-     * kernels (with the __global__ decorator) in order to actually run code
-     * in parallel on the GPU.
-     * Note you are given the real length of the array, but may assume that
-     * both the data array is sized to accommodate the next
-     * power of 2 larger than the input.
-     */
+    int rounded_length = nextPow2(length);
+    
+    // Upsweep Phase
+    for (int twod = 1; twod < rounded_length; twod *= 2) {
+        int twod1 = twod * 2;
+        int totalCount = rounded_length / twod1;
+        int blockCount = (totalCount + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        upsweep_kernel<<<blockCount, BLOCK_SIZE>>>(device_data, rounded_length, twod);
+    }
+    // Downsweep Phase
+    for (int twod = rounded_length/2; twod >= 1; twod /= 2) {
+        int twod1 = twod * 2;
+        int totalCount = rounded_length / twod1;
+        int blockCount = (totalCount + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        downsweep_kernel<<<blockCount, BLOCK_SIZE>>>(device_data, rounded_length, twod);
+    }
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -108,6 +140,23 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration;
 }
 
+__global__ void
+peak_find_kernel(int *inarray, int N, int *resultarray) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= 1 && i < N-1) {
+        bool isPeak = inarray[i-1] < inarray[i] && inarray[i] > inarray[i+1];
+        resultarray[i] = (isPeak) ? 1 : 0;
+    }
+}
+
+__global__ void
+peak_reduce_kernel(int *inarray, int N, int *resultarray) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if ((i < N-1) && (inarray[i] != inarray[i+1])) 
+        resultarray[inarray[i]] = i;
+}
 
 
 int find_peaks(int *device_input, int length, int *device_output) {
@@ -125,9 +174,25 @@ int find_peaks(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_peaks are correct given the original length.
      */
-    return 0;
-}
+    int *peaks_array;
+    int rounded_length = nextPow2(length);
+    int blockCount = (rounded_length + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    // Map peaks to 1 and non-peaks to 0.
+    cudaMalloc((void **)&peaks_array, rounded_length * sizeof(int));
+    peak_find_kernel<<<blockCount, BLOCK_SIZE>>>(device_input, length, peaks_array);
 
+    // Perform exclusive scan on peaks_array to collect results.
+    exclusive_scan(peaks_array, length);
+    peak_reduce_kernel<<<blockCount, BLOCK_SIZE>>>(peaks_array, length, device_output);
+
+    // Retrieve return size, which is the last element of peaks_array.
+    int return_size;
+    cudaMemcpy(&return_size, peaks_array + (length - 1), sizeof(int),
+        cudaMemcpyDeviceToHost);
+
+    return return_size;
+}
 
 
 /* Timing wrapper around find_peaks. You should not modify this function.
